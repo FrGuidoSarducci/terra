@@ -1,0 +1,209 @@
+# Cloudflare Pages configuration
+
+name = "terraviz"
+compatibility_date = "2024-12-01"
+
+# Workers AI — deliberately NOT declared here.
+#
+# `AI` is a real production binding. The Orbit chat proxy, voice
+# STT/TTS, dataset embeddings, event enrichment and blog drafting
+# all call `env.AI`, at no extra cost on the free tier (~10k
+# requests/day). It is wired in the dashboard like every other
+# binding in this file — Settings → Bindings → Workers AI →
+# variable name `AI` — and audited by `npm run check:pages-bindings`
+# against `scripts/lib/expected-bindings.ts`, which is where the
+# deploy-time contract actually lives.
+#
+# What makes it the one binding not also declared here for
+# documentation, the way the blocks below are: wrangler opens an
+# authenticated *remote* proxy session for an AI binding before
+# `pages dev` will serve anything. Declaring it made a fresh clone
+# impossible to run without `wrangler login`, even though
+# `.dev.vars` sets `MOCK_AI=true` precisely so the real service is
+# not needed. Every other binding here runs local.
+#
+# There is no way to keep both the declaration and the offline
+# loop: `experimental_remote = false` leaves the binding in remote
+# mode, `remote = false` reports it as "not supported" and opens
+# the session anyway, and `pages dev` rejects `--config`.
+#
+# To exercise real Workers AI locally, `wrangler login` and then
+# `npm run dev:functions:ai` — same binding, passed as `--ai AI`.
+
+# D1 database for storing AI feedback (thumbs up/down ratings)
+[[d1_databases]]
+binding = "FEEDBACK_DB"
+database_name = "sphere-feedback"
+database_id = "78fbe5c3-8e40-4504-b183-155b0069222e"
+migrations_dir = "migrations"
+
+# Catalog backend (Phase 1a onward) — datasets, tours, publishers,
+# audit_events. Same physical D1 instance as FEEDBACK_DB above
+# (per CATALOG_BACKEND_PLAN.md "Cloudflare service mapping": "Same
+# DB instance as FEEDBACK_DB, separate tables"); the second binding
+# exists so the catalog migrations live under their own directory
+# and can be applied independently with
+# `wrangler d1 migrations apply CATALOG_DB`.
+#
+# Like the other bindings here, **Pages reads its bindings from the
+# dashboard, not this file** — adding the binding in source control
+# documents the canonical name + directory and makes a future
+# Workers-deploy migration mechanical. Wire it under
+# Settings → Bindings → D1 → variable name CATALOG_DB → database
+# `sphere-feedback`.
+[[d1_databases]]
+binding = "CATALOG_DB"
+database_name = "sphere-feedback"
+database_id = "78fbe5c3-8e40-4504-b183-155b0069222e"
+migrations_dir = "migrations/catalog"
+
+# Analytics Engine dataset for the telemetry event stream.
+# Every datapoint written by functions/api/ingest.ts lands here.
+# Query via the AE SQL API; see docs/ANALYTICS_QUERIES.md.
+#
+# Heads-up: Cloudflare Pages does not auto-pick up bindings from
+# this file — they must be added through the project's
+# Settings → Bindings UI (variable name `ANALYTICS`, dataset
+# `terraviz_events`, attached to both Production and Preview).
+# This declaration is kept in source control because (a) it
+# documents the canonical binding/dataset names, and (b) it works
+# for any future migration to a Workers deploy where wrangler.toml
+# is authoritative.
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "terraviz_events"
+
+# KV namespace for the runtime telemetry kill switch. The ingest
+# endpoint reads the key `telemetry_enabled` on every request; when
+# set to `disabled` / `false` / `off` / `0`, clients receive 410 Gone
+# and cool down for the rest of the session. Absent or any other
+# value = allow.
+#
+# Like the other bindings in this file, **Pages reads its bindings
+# from the dashboard, not this block** — `Settings → Bindings → KV →
+# variable name TELEMETRY_KILL_SWITCH, namespace = the one below`.
+# Kept declared (rather than commented out) so the canonical
+# binding name + namespace ID are visible in source control and so
+# any future Workers deploy where wrangler.toml is authoritative
+# picks it up automatically.
+#
+# Operations:
+#   - Activate (clients receive 410):
+#       wrangler kv key put telemetry_enabled disabled \
+#         --namespace-id=9c022b1295314939b76a28769fef6195
+#   - Deactivate (back to normal):
+#       wrangler kv key delete telemetry_enabled \
+#         --namespace-id=9c022b1295314939b76a28769fef6195
+[[kv_namespaces]]
+binding = "TELEMETRY_KILL_SWITCH"
+id = "9c022b1295314939b76a28769fef6195"
+
+# KV namespace for the catalog read API's hot-path snapshot cache.
+# `functions/api/v1/catalog.ts` lazily renders the public catalog
+# response and caches it under a single key keyed by ETag. Cache is
+# invalidated on every publish / retract (wired in Commit F).
+# Without this snapshot, `/api/v1/catalog` would issue ~5 D1 queries
+# per browse-page load and burn the 5 M-row-reads/day free-tier
+# budget — see "Free-tier viability" in CATALOG_BACKEND_PLAN.md.
+#
+# Binding name only; the namespace ID is a placeholder and must be
+# replaced with the operator's real namespace before deploy. Local
+# Wrangler doesn't validate the ID — it provisions an in-memory KV
+# under `.wrangler/state/v3/kv/<id>/` regardless. Pages reads the
+# binding from the dashboard, not this file: wire it under
+# Settings → Bindings → KV → variable name CATALOG_KV → namespace
+# created via `wrangler kv namespace create CATALOG_KV`.
+[[kv_namespaces]]
+binding = "CATALOG_KV"
+id = "00000000000000000000000000000000"
+
+# R2 bucket for catalog assets (Phase 1b onward) — sphere thumbnails,
+# image data refs, legends, captions, and tour JSON. Stream handles
+# video uploads via its own API (see STREAM_ACCOUNT_ID +
+# STREAM_API_TOKEN secrets); R2 carries everything else. Keys are
+# content-addressed (`datasets/{id}/by-digest/sha256/{hex}/asset.{ext}`)
+# per `docs/CATALOG_ASSETS_PIPELINE.md`, so revisions land at new
+# paths without invalidating existing caches.
+#
+# Two parallel access modes:
+#   - The Workers binding below is what server-side handlers use to
+#     read just-uploaded bytes and verify `content_digest`. Wrangler
+#     provisions a local on-disk bucket under
+#     `.wrangler/state/v3/r2/` even without real R2 credentials, so
+#     tests + dev work offline.
+#   - Browser / CLI uploads use S3-compatible presigned PUT URLs
+#     minted by `functions/api/v1/_lib/r2-store.ts`. That path needs
+#     `R2_S3_ENDPOINT`, `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY`
+#     in `.dev.vars` (or `MOCK_R2=true` for the contributor
+#     walkthrough, which skips signing).
+#
+# Pages reads the binding from the dashboard, not this file: wire it
+# under Settings → Bindings → R2 → variable name CATALOG_R2 → bucket
+# created via `wrangler r2 bucket create terraviz-assets`. The bucket
+# name override knob is `CATALOG_R2_BUCKET` in `.dev.vars` (default
+# `terraviz-assets`, matching `bucket_name` below).
+[[r2_buckets]]
+binding = "CATALOG_R2"
+bucket_name = "terraviz-assets"
+
+# Vectorize index for the docent's semantic search, Phase 1c
+# onward. Holds 768-dim embeddings — one per published dataset —
+# produced from `@cf/baai/bge-base-en-v1.5` against the canonical
+# embedding text built in `functions/api/v1/_lib/embeddings.ts`.
+# `_lib/vectorize-store.ts` is the only Workers-side consumer:
+# `upsertEmbedding` on publish/update, `deleteEmbedding` on retract,
+# `queryEmbedding` from the public `/api/v1/search?q=` endpoint and
+# the docent's `search_datasets` tool path.
+#
+# The Vectorize index itself is provisioned out-of-band via:
+#
+#   wrangler vectorize create terraviz-datasets \
+#     --dimensions=768 --metric=cosine
+#   wrangler vectorize create-metadata-index terraviz-datasets \
+#     --property-name=peer_id --type=string
+#   wrangler vectorize create-metadata-index terraviz-datasets \
+#     --property-name=category --type=string
+#   wrangler vectorize create-metadata-index terraviz-datasets \
+#     --property-name=visibility --type=string
+#
+# The contributor walkthrough does NOT need a real index: setting
+# `MOCK_VECTORIZE=true` in `.dev.vars` swaps the binding for an
+# in-memory mock that implements cosine similarity end-to-end. See
+# `docs/CATALOG_BACKEND_DEVELOPMENT.md` for the full setup.
+#
+# Pages reads the binding from the dashboard, not this file: wire it
+# under Settings → Bindings → Vectorize → variable name
+# CATALOG_VECTORIZE → index `terraviz-datasets`.
+[[vectorize]]
+binding = "CATALOG_VECTORIZE"
+index_name = "terraviz-datasets"
+
+# --- Orbit voice (Phase 2) ---
+#
+# The voice Pages Functions (/api/voice/transcribe, /api/voice/synthesize)
+# run STT/TTS on the same `AI` binding above — no extra binding needed.
+#
+# KILL_VOICE is a plain environment variable (not a binding) and a
+# kill switch: set it to a deny value (`1` / `true` / `on` /
+# `disabled`) in the Pages dashboard (Settings → Variables) to make
+# both voice endpoints return 503 so clients cool down and fall back
+# to the browser engine. Absent / any other value = voice enabled.
+# See docs/ORBIT_VOICE_PLAN.md §6, §8 (decision 4).
+#
+# --- Orbit voice realtime streaming (Phase 3) ---
+#
+# /api/voice/stream proxies a browser WebSocket to Cloudflare's AI
+# Gateway realtime endpoint (Deepgram Nova-3/Flux) for live interim
+# transcripts. Configure in the Pages dashboard (Settings → Variables);
+# absent any of these (or with KILL_VOICE set) the route accepts the
+# socket and sends a JSON error frame ({type:"error",code}) before
+# closing — a browser WebSocket can't read an HTTP status — so the
+# client disables WS streaming for the session and the resolver falls
+# back to the batch Whisper engine. That makes this opt-in:
+#   CF_ACCOUNT_ID     - Cloudflare account id (plain var)
+#   CF_AI_GATEWAY     - AI Gateway name (plain var)
+#   CF_AIG_TOKEN      - AI Gateway authorization, the `cf-aig-authorization`
+#                       value (store as an ENCRYPTED secret, never plaintext)
+#   VOICE_STREAM_MODEL - optional override, defaults to @cf/deepgram/nova-3
+# See docs/ORBIT_VOICE_PLAN.md §3 and
+# https://developers.cloudflare.com/ai-gateway/usage/websockets-api/realtime-api/
